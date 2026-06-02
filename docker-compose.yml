@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    container_name: minecraft-discord-bot
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file:
+      - .env
+    environment:
+      MINECRAFT_DATA_DIR: /minecraft-data
+      BOT_DATA_DIR: /bot-data
+      BINDINGS_PATH: /bot-data/bindings.json
+      MC_RCON_HOST: mc
+      MC_RCON_PORT: "25575"
+    volumes:
+      - /home/bowen/services/minecraft/data:/minecraft-data
+      - ./data:/bot-data
+    networks:
+      - minecraft_default
+
+networks:
+  minecraft_default:
+    external: true
