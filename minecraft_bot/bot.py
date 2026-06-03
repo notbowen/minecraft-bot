@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 
 from .bindings import BindingStore
 from .config import Settings
+from .connect import ConnectInfo, PublicIpError, fetch_public_ip
 from .minecraft import MinecraftData, WhitelistRemovalResult, normalize_username, offline_uuid
 from .rcon import RconClient, RconError
 from .stats import summarize_stats
@@ -18,6 +20,11 @@ from .stats import summarize_stats
 
 LOGGER = logging.getLogger(__name__)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+PLAYER_LIST_RE = re.compile(
+    r"There are\s+(?P<online>\d+)\s+of\s+(?:a\s+)?max(?:imum)?\s+of\s+(?P<max>\d+)\s+players\s+online",
+    re.IGNORECASE,
+)
+STATUS_UPDATE_SECONDS = 60
 
 
 class MinecraftManager(commands.Cog):
@@ -152,6 +159,31 @@ class MinecraftManager(commands.Cog):
         embed.add_field(name="Top used", value=summary.top_used, inline=True)
         await interaction.followup.send(embed=embed)
 
+    @app_commands.command(name="connect", description="Show the Minecraft server address.")
+    async def connect(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+
+        try:
+            public_ip = await asyncio.to_thread(fetch_public_ip, self.settings.ip_guide_url)
+        except PublicIpError as error:
+            LOGGER.warning("Public IP lookup failed: %s", error)
+            await interaction.followup.send("I could not fetch the current server IP. Try again later.")
+            return
+
+        connect_info = ConnectInfo(ip=public_ip, port=self.settings.connect_port)
+        embed = discord.Embed(
+            title="Minecraft Server",
+            color=discord.Color.green(),
+        )
+        embed.add_field(
+            name="Direct Connect",
+            value=f"```text\n{connect_info.address}\n```",
+            inline=False,
+        )
+        embed.add_field(name="IP", value=f"`{connect_info.ip}`", inline=True)
+        embed.add_field(name="Port", value=f"`{connect_info.port}`", inline=True)
+        await interaction.followup.send(embed=embed)
+
     async def _reload_and_verify_whitelist(self, username: str, *, removed_username: str | None = None) -> str:
         try:
             reload_response = await self.rcon.execute("whitelist reload")
@@ -218,6 +250,14 @@ class MinecraftDiscordBot(commands.Bot):
         intents.members = settings.join_dm_enabled
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.settings = settings
+        self.status_rcon = RconClient(
+            host=settings.rcon_host,
+            port=settings.rcon_port,
+            password=settings.rcon_password,
+            timeout_seconds=settings.rcon_timeout_seconds,
+        )
+        self._status_task: asyncio.Task[None] | None = None
+        self._last_status_text: str | None = None
 
     async def setup_hook(self) -> None:
         await self.add_cog(MinecraftManager(self.settings))
@@ -232,6 +272,15 @@ class MinecraftDiscordBot(commands.Bot):
 
     async def on_ready(self) -> None:
         LOGGER.info("Logged in as %s", self.user)
+        if self._status_task is None or self._status_task.done():
+            self._status_task = asyncio.create_task(self._status_loop())
+
+    async def close(self) -> None:
+        if self._status_task is not None:
+            self._status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_task
+        await super().close()
 
     async def on_member_join(self, member: discord.Member) -> None:
         if not self.settings.join_dm_enabled:
@@ -240,6 +289,36 @@ class MinecraftDiscordBot(commands.Bot):
             await member.send("Use `/bind <username>` in the server to whitelist your Minecraft account.")
         except discord.HTTPException:
             LOGGER.info("Could not DM new member %s", member.id)
+
+    async def _status_loop(self) -> None:
+        while not self.is_closed():
+            await self._update_player_status()
+            await asyncio.sleep(STATUS_UPDATE_SECONDS)
+
+    async def _update_player_status(self) -> None:
+        try:
+            response = await self.status_rcon.execute("list")
+            player_count = _parse_player_count_response(response)
+            if player_count is None:
+                raise RconError(f"Could not parse player list response: {response!r}")
+            status_text = _format_player_count_status(*player_count)
+        except (OSError, asyncio.TimeoutError, RconError) as error:
+            LOGGER.warning("Player-count status update failed: %s", error)
+            status_text = "Minecraft server unavailable"
+
+        if status_text == self._last_status_text:
+            return
+        try:
+            await self.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=status_text,
+                ),
+            )
+        except discord.HTTPException as error:
+            LOGGER.warning("Could not update Discord status: %s", error)
+            return
+        self._last_status_text = status_text
 
 
 def run() -> None:
@@ -257,6 +336,19 @@ def _whitelist_list_contains(response: str, username: str) -> bool:
         return False
     names = [name.strip().casefold() for name in names_text.split(",")]
     return username.casefold() in names
+
+
+def _parse_player_count_response(response: str) -> tuple[int, int] | None:
+    response = ANSI_RE.sub("", response)
+    match = PLAYER_LIST_RE.search(response)
+    if match is None:
+        return None
+    return int(match.group("online")), int(match.group("max"))
+
+
+def _format_player_count_status(online: int, max_players: int) -> str:
+    noun = "player" if online == 1 else "players"
+    return f"{online}/{max_players} {noun} online"
 
 
 def _removed_username_for_verification(

@@ -22,6 +22,8 @@ class Settings:
     discord_token: str
     discord_guild_id: int | None
     role_id: int | None
+    connect_port: int
+    ip_guide_url: str
     minecraft_data_dir: Path
     bindings_path: Path
     rcon_host: str
@@ -44,6 +46,8 @@ class Settings:
             discord_token=token,
             discord_guild_id=_optional_int(os.getenv("DISCORD_GUILD_ID")),
             role_id=_optional_int(os.getenv("ROLE_ID")),
+            connect_port=int(os.getenv("MINECRAFT_CONNECT_PORT", "25565")),
+            ip_guide_url=os.getenv("IP_GUIDE_URL", "https://ip.guide").strip() or "https://ip.guide",
             minecraft_data_dir=data_dir,
             bindings_path=bindings_path,
             rcon_host=os.getenv("MC_RCON_HOST", "mc").strip() or "mc",

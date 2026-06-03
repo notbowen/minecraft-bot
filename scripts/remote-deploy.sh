@@ -16,6 +16,8 @@ ensure_env_key() {
 }
 
 ensure_env_key ROLE_ID
+ensure_env_key MINECRAFT_CONNECT_PORT 25565
+ensure_env_key IP_GUIDE_URL https://ip.guide
 
 if ! grep -Eq '^MC_RCON_PASSWORD=.+$' .env; then
   password="$(
